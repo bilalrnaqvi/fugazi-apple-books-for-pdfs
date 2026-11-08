@@ -1,4 +1,4 @@
-# Books for PDFs
+# Apple Books for PDFs
 
 **Apple Books, but for PDFs.** A macOS reader that gives PDFs the Books experience — a library of covers, full-screen spreads, highlights and notes — while showing every page exactly as it was laid out, graphics and all.
 
