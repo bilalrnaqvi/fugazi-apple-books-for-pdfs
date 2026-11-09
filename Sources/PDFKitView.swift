@@ -262,7 +262,10 @@ final class BraceAnnotation: PDFAnnotation {
         path.addLine(to: CGPoint(x: x, y: bottom + 7))
         path.addQuadCurve(to: CGPoint(x: x + hook, y: bottom), control: CGPoint(x: x, y: bottom))
         context.saveGState()
-        context.setStrokeColor(ink.cgColor)
+        // Dark ink on paper; light ink on Night's charcoal paper (keep the draft's translucency).
+        let color = NightRendering.enabled
+            ? NSColor(calibratedWhite: 0.90, alpha: ink.alphaComponent) : ink
+        context.setStrokeColor(color.cgColor)
         context.setLineWidth(2.1)
         context.setLineCap(.round)
         context.setLineJoin(.round)

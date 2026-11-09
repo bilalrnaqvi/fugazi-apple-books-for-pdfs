@@ -206,8 +206,45 @@ final class NightPage: PDFPage {
         context.restoreGState()
         DispatchQueue.main.async { [weak self] in if let self { NightRendering.onPageDrawn?(self) } }
         if displaysAnnotations {
-            for a in annotations where a.shouldDisplay { a.draw(with: box, in: context) }
+            // Annotations live in PDF page space; map it to box-at-origin space like super.draw does,
+            // or they drift by the crop box's offset (e.g. braces landing in the page header).
+            context.saveGState()
+            context.concatenate(job.transform)
+            for a in annotations where a.shouldDisplay {
+                if a.type == "Highlight",
+                   a.userName?.hasPrefix(FolioPDFView.annotationPrefix) == true {
+                    NightPage.drawNightHighlight(a, in: context)
+                } else {
+                    a.draw(with: box, in: context)
+                }
+            }
+            context.restoreGState()
         }
+    }
+
+    /// PDFKit draws highlights with a multiply blend, which turns to mud on dark paper. In Night mode
+    /// draw them as a translucent wash of their color instead.
+    static func drawNightHighlight(_ a: PDFAnnotation, in ctx: CGContext) {
+        guard let color = a.color.usingColorSpace(.sRGB) else { return }
+        ctx.saveGState()
+        ctx.setBlendMode(.normal)
+        ctx.setFillColor(CGColor(srgbRed: color.redComponent, green: color.greenComponent, blue: color.blueComponent, alpha: 0.42))
+        let quads = a.quadrilateralPoints ?? []
+        let b = a.bounds
+        if quads.count >= 4 {
+            var i = 0
+            while i + 3 < quads.count {
+                let pts = quads[i..<i + 4].map { $0.pointValue }
+                let xs = pts.map(\.x), ys = pts.map(\.y)
+                let r = CGRect(x: b.minX + xs.min()!, y: b.minY + ys.min()!,
+                               width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
+                ctx.fill(r.insetBy(dx: 0, dy: -1))
+                i += 4
+            }
+        } else {
+            ctx.fill(b)
+        }
+        ctx.restoreGState()
     }
 
     /// Decide from the pixels whether an embedded image is a *picture* (keep as printed) or
