@@ -222,13 +222,17 @@ final class NightPage: PDFPage {
         }
     }
 
-    /// PDFKit draws highlights with a multiply blend, which turns to mud on dark paper. In Night mode
-    /// draw them as a translucent wash of their color instead.
+    /// Night highlights behave like a marker *under* the ink: a deep version of the color drawn with a
+    /// lighten blend. Dark paper takes the tint; light text is brighter than the tint so it stays
+    /// exactly as it was, keeping full contrast. (A wash on top lifted the paper toward the text.)
     static func drawNightHighlight(_ a: PDFAnnotation, in ctx: CGContext) {
         guard let color = a.color.usingColorSpace(.sRGB) else { return }
+        let cr = color.redComponent, cg = color.greenComponent, cb = color.blueComponent
+        let lum = 0.2126 * cr + 0.7152 * cg + 0.0722 * cb
+        let k = min(1, 0.34 / max(lum, 0.01))       // scale the color to a deep, ~34%-bright tint
         ctx.saveGState()
-        ctx.setBlendMode(.normal)
-        ctx.setFillColor(CGColor(srgbRed: color.redComponent, green: color.greenComponent, blue: color.blueComponent, alpha: 0.42))
+        ctx.setBlendMode(.lighten)
+        ctx.setFillColor(CGColor(srgbRed: cr * k, green: cg * k, blue: cb * k, alpha: 1))
         let quads = a.quadrilateralPoints ?? []
         let b = a.bounds
         if quads.count >= 4 {
