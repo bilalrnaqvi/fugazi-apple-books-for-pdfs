@@ -121,6 +121,7 @@ struct HighlightMenuState: Identifiable {
     var anchor: CGRect              // top-left-origin coords matching the SwiftUI overlay
     var selection: PDFSelection?    // new highlight from this selection…
     var existing: Highlight?        // …or editing this one
+    var editNote = false            // open straight into the note editor (margin notes)
 }
 
 extension Highlight {
@@ -155,6 +156,9 @@ final class ReaderController {
     var pendingHighlight: Highlight?
     /// In-window highlight bubble (Books-style), positioned in the PDF view's SwiftUI coordinates.
     var menu: HighlightMenuState?
+
+    /// A margin note just drawn; removed again if the editor closes with nothing written.
+    var pendingNewNote: UUID?
 
     func dismissMenu() {
         menu = nil
@@ -262,6 +266,7 @@ final class BraceAnnotation: PDFAnnotation {
         path.addLine(to: CGPoint(x: x, y: bottom + 7))
         path.addQuadCurve(to: CGPoint(x: x + hook, y: bottom), control: CGPoint(x: x, y: bottom))
         context.saveGState()
+        page?.transform(context, for: box)   // custom annotations map page space themselves
         // Dark ink on paper; light ink on Night's charcoal paper (keep the draft's translucency).
         let color = NightRendering.enabled
             ? NSColor(calibratedWhite: 0.90, alpha: ink.alphaComponent) : ink
@@ -275,7 +280,85 @@ final class BraceAnnotation: PDFAnnotation {
     }
 }
 
+// MARK: - Margin note card (writing in the margin)
+
+final class MarginNoteAnnotation: PDFAnnotation {
+    private let text: String
+    private let tint: NSColor
+    private let isDraft: Bool
+
+    init(box: CGRect, text: String, tint: NSColor, draft: Bool = false) {
+        self.text = text
+        self.tint = tint
+        self.isDraft = draft
+        super.init(bounds: box, forType: .freeText, withProperties: nil)
+        shouldDisplay = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(with box: PDFDisplayBox, in context: CGContext) {
+        let night = NightRendering.enabled
+        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = CGPath(roundedRect: r, cornerWidth: 4, cornerHeight: 4, transform: nil)
+        context.saveGState()
+        page?.transform(context, for: box)   // custom annotations map page space themselves
+        if isDraft {
+            context.setStrokeColor((night ? NSColor(white: 0.85, alpha: 0.8) : NSColor(white: 0.25, alpha: 0.7)).cgColor)
+            context.setLineWidth(1)
+            context.setLineDash(phase: 0, lengths: [4, 3])
+            context.addPath(path); context.strokePath()
+            context.restoreGState()
+            return
+        }
+        // Card: a pale wash of the note color on paper; a dark card with a colored edge at night.
+        let t = tint.usingColorSpace(.sRGB) ?? tint
+        let fill = night
+            ? NSColor(srgbRed: 0.17 + t.redComponent * 0.06, green: 0.17 + t.greenComponent * 0.06,
+                      blue: 0.17 + t.blueComponent * 0.06, alpha: 0.96)
+            : NSColor(srgbRed: 1 - (1 - t.redComponent) * 0.22, green: 1 - (1 - t.greenComponent) * 0.22,
+                      blue: 1 - (1 - t.blueComponent) * 0.22, alpha: 0.96)
+        context.setShadow(offset: CGSize(width: 0, height: -0.6), blur: 1.8, color: NSColor(white: 0, alpha: night ? 0.5 : 0.18).cgColor)
+        context.setFillColor(fill.cgColor)
+        context.addPath(path); context.fillPath()
+        context.setShadow(offset: .zero, blur: 0, color: nil)
+        context.setStrokeColor(t.withAlphaComponent(night ? 0.55 : 0.45).cgColor)
+        context.setLineWidth(0.8)
+        context.addPath(path); context.strokePath()
+
+        // Handwriting-style text, shrunk to fit the card.
+        let inner = r.insetBy(dx: 4, dy: 3)
+        let ink = night ? NSColor(white: 0.90, alpha: 1) : NSColor(white: 0.16, alpha: 1)
+        let body = text.isEmpty ? "…" : text
+        var size: CGFloat = 11
+        var attr = NSAttributedString()
+        let para = NSMutableParagraphStyle(); para.lineBreakMode = .byWordWrapping
+        while true {
+            let font = NSFont(name: "Noteworthy-Light", size: size) ?? NSFont.systemFont(ofSize: size)
+            attr = NSAttributedString(string: body, attributes: [.font: font, .foregroundColor: ink, .paragraphStyle: para])
+            let need = attr.boundingRect(with: NSSize(width: inner.width, height: .greatestFiniteMagnitude),
+                                         options: [.usesLineFragmentOrigin, .usesFontLeading]).height
+            if need <= inner.height || size <= 5.5 { break }
+            size -= 0.5
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        context.clip(to: inner)
+        attr.draw(with: inner, options: [.usesLineFragmentOrigin, .usesFontLeading])
+        NSGraphicsContext.restoreGraphicsState()
+        context.restoreGState()
+    }
+}
+
 extension PDFPage {
+    /// Lines a margin note at `box` belongs to: those beside it, or else the nearest line.
+    func linesBeside(_ box: CGRect) -> (rects: [CGRect], text: String) {
+        let beside = lines(betweenY: box.minY, and: box.maxY)
+        if !beside.rects.isEmpty { return beside }
+        let near = lines(betweenY: box.minY - 60, and: box.maxY + 60)
+        guard let best = near.rects.min(by: { abs($0.midY - box.midY) < abs($1.midY - box.midY) }) else { return ([], "") }
+        return lines(betweenY: best.minY + 1, and: best.maxY - 1)
+    }
+
     /// Text-line rects (page space) between two y values, plus the text they contain.
     func lines(betweenY a: CGFloat, and b: CGFloat) -> (rects: [CGRect], text: String) {
         let pb = bounds(for: .cropBox)
@@ -317,6 +400,10 @@ final class FolioPDFView: PDFView {
     var onHover: (@MainActor (NSPoint?) -> Void)?
     var onMouseDown: (@MainActor () -> Void)?
     var onBrace: (@MainActor (PDFPage, [CGRect], String, Bool) -> Void)?
+    var onMarginNote: (@MainActor (PDFPage, CGRect) -> Void)?
+    private var noteStart: (page: PDFPage, point: NSPoint, event: NSEvent)?
+    private var noteDraft: MarginNoteAnnotation?
+    private var noteMoved = false
     private var braceStart: (page: PDFPage, y: CGFloat, left: Bool)?
     private var braceDraft: BraceAnnotation?
     var onResize: (@MainActor () -> Void)?
@@ -561,6 +648,47 @@ final class FolioPDFView: PDFView {
         reportSelection()
     }
 
+    // MARK: Right-drag: draw a margin note card. A plain right-click still shows the context menu.
+
+    override func rightMouseDown(with event: NSEvent) {
+        onMouseDown?()
+        let p = convert(event.locationInWindow, from: nil)
+        guard let page = page(for: p, nearest: true) else { super.rightMouseDown(with: event); return }
+        noteStart = (page, convert(p, to: page), event)
+        noteMoved = false
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        guard let start = noteStart else { super.rightMouseDragged(with: event); return }
+        let q = convert(convert(event.locationInWindow, from: nil), to: start.page)
+        if !noteMoved, hypot(q.x - start.point.x, q.y - start.point.y) > 6 { noteMoved = true; clearSelection() }
+        guard noteMoved else { return }
+        if let d = noteDraft { start.page.removeAnnotation(d) }
+        let d = MarginNoteAnnotation(box: Self.box(start.point, q, on: start.page), text: "", tint: .systemYellow, draft: true)
+        start.page.addAnnotation(d)
+        noteDraft = d
+        needsDisplay = true
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        guard let start = noteStart else { super.rightMouseUp(with: event); return }
+        noteStart = nil
+        if let d = noteDraft { start.page.removeAnnotation(d); noteDraft = nil; needsDisplay = true }
+        if noteMoved {
+            var r = Self.box(start.point, convert(convert(event.locationInWindow, from: nil), to: start.page), on: start.page)
+            if r.width < 40 { r.size.width = 110 }
+            if r.height < 18 { r.size.height = 44; r.origin.y -= 44 - 18 }
+            onMarginNote?(start.page, r)
+        } else if let m = menu(for: start.event) {
+            NSMenu.popUpContextMenu(m, with: start.event, for: self)
+        }
+    }
+
+    private static func box(_ a: NSPoint, _ b: NSPoint, on page: PDFPage) -> CGRect {
+        let r = CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
+        return r.intersection(page.bounds(for: .cropBox))
+    }
+
     /// When the drag spans no text (image, blank area), brace a strip beside the drag instead.
     private func fallbackRect(_ start: (page: PDFPage, y: CGFloat, left: Bool), _ y: CGFloat) -> CGRect {
         let pb = start.page.bounds(for: .cropBox)
@@ -586,6 +714,13 @@ final class FolioPDFView: PDFView {
         }
         for h in highlights {
             guard let page = doc.page(at: h.page), !h.rects.isEmpty else { continue }
+            if h.kind == .marginNote {
+                let a = MarginNoteAnnotation(box: h.box ?? h.bounds, text: h.note, tint: h.color.nsColor)
+                a.userName = annotationPrefix + h.id.uuidString
+                a.contents = h.note
+                page.addAnnotation(a)
+                continue
+            }
             if h.kind == .brace {
                 let a = BraceAnnotation(rects: h.rects, onLeft: h.braceOnLeft)
                 a.userName = annotationPrefix + h.id.uuidString
@@ -734,6 +869,16 @@ struct PDFKitView: NSViewRepresentable {
                 LibraryStore.shared.addHighlights(self.parent.bookID, [h])
             }
             v.onHighlightClick = { [weak self] id, r in self?.showMenu(forExisting: id, at: r) }
+            v.onMarginNote = { [weak self] page, box in
+                guard let self, let v = self.view, let doc = v.document else { return }
+                let linked = page.linesBeside(box)
+                let h = Highlight(id: UUID(), page: doc.index(for: page),
+                                  rects: linked.rects.isEmpty ? [box] : linked.rects, color: .yellow,
+                                  text: linked.text, note: "", createdAt: Date(), kind: .marginNote, box: box)
+                LibraryStore.shared.addHighlights(self.parent.bookID, [h])
+                self.parent.controller.pendingNewNote = h.id
+                self.showMenu(forExisting: h.id, at: v.convert(box, from: page), edit: true)
+            }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
                 MainActor.assumeIsolated { self?.handleKey(e) == true ? nil : e }
             }
@@ -926,11 +1071,12 @@ struct PDFKitView: NSViewRepresentable {
             parent.controller.menu = HighlightMenuState(anchor: anchor, selection: sel, existing: nil)
         }
 
-        private func showMenu(forExisting id: UUID, at rect: NSRect) {
+        private func showMenu(forExisting id: UUID, at rect: NSRect, edit: Bool = false) {
             guard let h = LibraryStore.shared.book(parent.bookID)?.highlights.first(where: { $0.id == id }) else { return }
             let anchor = flipped(rect)
             lastMenuAnchor = anchor
-            parent.controller.menu = HighlightMenuState(anchor: anchor, selection: nil, existing: h)
+            parent.controller.menu = HighlightMenuState(anchor: anchor, selection: nil, existing: h,
+                                                        editNote: edit || h.kind == .marginNote)
         }
 
         // MARK: Keys
@@ -972,6 +1118,8 @@ struct HighlightMenuView: View {
     let current: HighlightColor?
     let initialNote: String
     let isExisting: Bool
+    var isMarginNote = false
+    var startEditing = false
     let onColor: (HighlightColor) -> Void
     let onSaveNote: (String) -> Void
     let onCopy: () -> Void
@@ -999,13 +1147,15 @@ struct HighlightMenuView: View {
                     .buttonStyle(.plain)
                     .help(c.label)
                 }
-                Button { onColor(.underline) } label: {
-                    Image(systemName: "underline")
-                        .font(.body.weight(.semibold))
-                        .frame(width: 22, height: 22)
-                        .foregroundStyle(current == .underline ? Color.red : .primary)
+                if !isMarginNote {
+                    Button { onColor(.underline) } label: {
+                        Image(systemName: "underline")
+                            .font(.body.weight(.semibold))
+                            .frame(width: 22, height: 22)
+                            .foregroundStyle(current == .underline ? Color.red : .primary)
+                    }
+                    .buttonStyle(.plain).help("Underline")
                 }
-                .buttonStyle(.plain).help("Underline")
                 Divider().frame(height: 18)
                 iconButton("note.text", help: isExisting ? "Edit Note" : "Add Note") {
                     withAnimation(.easeOut(duration: 0.15)) { showNote.toggle() }
@@ -1013,7 +1163,7 @@ struct HighlightMenuView: View {
                 }
                 iconButton("doc.on.doc", help: "Copy", action: onCopy)
                 if let onDelete {
-                    iconButton("trash", help: "Remove Highlight", action: onDelete).foregroundStyle(.red)
+                    iconButton("trash", help: isMarginNote ? "Remove Note" : "Remove Highlight", action: onDelete).foregroundStyle(.red)
                 }
             }
             if showNote {
@@ -1025,7 +1175,7 @@ struct HighlightMenuView: View {
                         .padding(6)
                         .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
                         .focused($noteFocused)
-                    Button(isExisting ? "Save Note" : "Highlight & Save Note") { onSaveNote(note) }
+                    Button(isMarginNote ? "Done" : isExisting ? "Save Note" : "Highlight & Save Note") { onSaveNote(note) }
                         .keyboardShortcut(.return, modifiers: .command)
                         .controlSize(.small)
                 }
@@ -1033,7 +1183,11 @@ struct HighlightMenuView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .onAppear { note = initialNote; if isExisting && !initialNote.isEmpty { showNote = true } }
+        .onAppear {
+            note = initialNote
+            if startEditing || (isExisting && !initialNote.isEmpty) { showNote = true }
+            if startEditing { DispatchQueue.main.async { noteFocused = true } }
+        }
     }
 
     private func iconButton(_ name: String, help: String, action: @escaping () -> Void) -> some View {

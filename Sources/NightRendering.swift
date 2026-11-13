@@ -206,19 +206,19 @@ final class NightPage: PDFPage {
         context.restoreGState()
         DispatchQueue.main.async { [weak self] in if let self { NightRendering.onPageDrawn?(self) } }
         if displaysAnnotations {
-            // Annotations live in PDF page space; map it to box-at-origin space like super.draw does,
-            // or they drift by the crop box's offset (e.g. braces landing in the page header).
-            context.saveGState()
-            context.concatenate(job.transform)
+            // Annotations draw themselves into page space (PDFKit's own and ours apply the box
+            // transform internally); only the hand-drawn highlight wash needs it mapped here.
             for a in annotations where a.shouldDisplay {
                 if a.type == "Highlight",
                    a.userName?.hasPrefix(FolioPDFView.annotationPrefix) == true {
+                    context.saveGState()
+                    context.concatenate(job.transform)
                     NightPage.drawNightHighlight(a, in: context)
+                    context.restoreGState()
                 } else {
                     a.draw(with: box, in: context)
                 }
             }
-            context.restoreGState()
         }
     }
 

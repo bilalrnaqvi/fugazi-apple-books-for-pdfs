@@ -130,6 +130,15 @@ struct ReaderView: View {
                 }
             }
             .animation(.easeOut(duration: 0.15), value: controller.menu?.id)
+            .onChange(of: controller.menu?.id) { _, _ in
+                // A just-drawn margin note whose editor closed with nothing written is removed.
+                guard let pid = controller.pendingNewNote, controller.menu?.existing?.id != pid else { return }
+                controller.pendingNewNote = nil
+                if let h = store.book(bookID)?.highlights.first(where: { $0.id == pid }),
+                   h.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    store.removeHighlight(bookID, pid)
+                }
+            }
         }
         .ignoresSafeArea()
         .navigationTitle(book.title)
@@ -198,6 +207,8 @@ struct ReaderView: View {
                     current: m.existing?.color,
                     initialNote: m.existing?.note ?? "",
                     isExisting: m.existing != nil,
+                    isMarginNote: m.existing?.kind == .marginNote,
+                    startEditing: m.editNote,
                     onColor: { c in
                         if let h = m.existing { store.updateHighlight(bookID, h.id) { $0.color = c } }
                         else if let sel = m.selection { store.addHighlights(bookID, Highlight.make(from: sel, in: doc, color: c, note: "")) }
@@ -507,7 +518,7 @@ private struct NotesList: View {
         Group {
             if hs.isEmpty {
                 ContentUnavailableView("No highlights yet", systemImage: "highlighter",
-                                       description: Text("Select text and pick a color, or hold ⌥ Option and drag in a margin to draw a brace. They all show up here."))
+                                       description: Text("Select text and pick a color, hold ⌥ Option and drag in a margin to draw a brace, or right-drag to write a margin note. They all show up here."))
             } else {
                 List(hs) { h in
                     Button { controller.pendingHighlight = h; controller.go(to: h) } label: {
@@ -515,15 +526,25 @@ private struct NotesList: View {
                             if h.kind == .brace {
                                 Text("{").font(.system(size: 26, weight: .light, design: .serif))
                                     .foregroundStyle(.primary).frame(width: 12)
+                            } else if h.kind == .marginNote {
+                                Image(systemName: "note.text").foregroundStyle(Color(nsColor: h.color.nsColor)).frame(width: 12)
                             } else {
                                 RoundedRectangle(cornerRadius: 2)
                                     .fill(Color(nsColor: h.color.nsColor))
                                     .frame(width: 4)
                             }
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(h.text.isEmpty ? "(image or empty selection)" : h.text)
-                                    .font(.callout).lineLimit(4)
-                                if !h.note.isEmpty {
+                                if h.kind == .marginNote {
+                                    Text(h.note.isEmpty ? "(empty note)" : h.note)
+                                        .font(.callout).lineLimit(4)
+                                    if !h.text.isEmpty {
+                                        Text("Beside: \(h.text)").font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                    }
+                                } else {
+                                    Text(h.text.isEmpty ? "(image or empty selection)" : h.text)
+                                        .font(.callout).lineLimit(4)
+                                }
+                                if !h.note.isEmpty, h.kind != .marginNote {
                                     Label(h.note, systemImage: "note.text")
                                         .font(.callout.italic()).foregroundStyle(.secondary).lineLimit(3)
                                 }

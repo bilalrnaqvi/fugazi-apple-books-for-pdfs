@@ -82,7 +82,7 @@ enum HighlightColor: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-enum HighlightKind: String, Codable { case fill, brace }
+enum HighlightKind: String, Codable { case fill, brace, marginNote }
 
 struct Highlight: Identifiable, Codable, Hashable {
     var id: UUID
@@ -94,13 +94,15 @@ struct Highlight: Identifiable, Codable, Hashable {
     var createdAt: Date
     var kind: HighlightKind = .fill
     var braceOnLeft: Bool = true  // for .brace: which margin it is drawn in
+    var box: CGRect? = nil        // for .marginNote: the note card, in PDF page space
 
     var bounds: CGRect { rects.reduce(CGRect.null) { $0.union($1) } }
 
     init(id: UUID, page: Int, rects: [CGRect], color: HighlightColor, text: String, note: String,
-         createdAt: Date, kind: HighlightKind = .fill, braceOnLeft: Bool = true) {
+         createdAt: Date, kind: HighlightKind = .fill, braceOnLeft: Bool = true, box: CGRect? = nil) {
         self.id = id; self.page = page; self.rects = rects; self.color = color; self.text = text
         self.note = note; self.createdAt = createdAt; self.kind = kind; self.braceOnLeft = braceOnLeft
+        self.box = box
     }
 
     init(from decoder: Decoder) throws {
@@ -114,6 +116,7 @@ struct Highlight: Identifiable, Codable, Hashable {
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         kind = try c.decodeIfPresent(HighlightKind.self, forKey: .kind) ?? .fill
         braceOnLeft = try c.decodeIfPresent(Bool.self, forKey: .braceOnLeft) ?? true
+        box = try c.decodeIfPresent(CGRect.self, forKey: .box)
     }
 }
 
