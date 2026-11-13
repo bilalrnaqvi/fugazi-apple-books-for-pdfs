@@ -240,7 +240,7 @@ final class BraceAnnotation: PDFAnnotation {
         lineRects = rects
         self.onLeft = onLeft
         let b = rects.reduce(CGRect.null) { $0.union($1) }
-        let spine = onLeft ? b.minX - 17 : b.maxX + 17
+        let spine = onLeft ? b.minX - 20 : b.maxX + 20
         super.init(bounds: CGRect(x: spine - 10, y: b.minY - 3, width: 20, height: b.height + 6),
                    forType: .ink, withProperties: nil)
         shouldDisplay = true
