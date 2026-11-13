@@ -518,7 +518,7 @@ private struct NotesList: View {
         Group {
             if hs.isEmpty {
                 ContentUnavailableView("No highlights yet", systemImage: "highlighter",
-                                       description: Text("Select text and pick a color, hold ⌥ Option and drag in a margin to draw a brace, or right-drag to write a margin note. They all show up here."))
+                                       description: Text("Select text and pick a color, hold ⌥ Option and drag in a margin to draw a brace, or ⌘ Command-drag to write a margin note. They all show up here."))
             } else {
                 List(hs) { h in
                     Button { controller.pendingHighlight = h; controller.go(to: h) } label: {

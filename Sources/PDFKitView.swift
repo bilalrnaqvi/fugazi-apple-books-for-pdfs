@@ -401,7 +401,7 @@ final class FolioPDFView: PDFView {
     var onMouseDown: (@MainActor () -> Void)?
     var onBrace: (@MainActor (PDFPage, [CGRect], String, Bool) -> Void)?
     var onMarginNote: (@MainActor (PDFPage, CGRect) -> Void)?
-    private var noteStart: (page: PDFPage, point: NSPoint, event: NSEvent)?
+    private var noteStart: (page: PDFPage, point: NSPoint)?
     private var noteDraft: MarginNoteAnnotation?
     private var noteMoved = false
     private var braceStart: (page: PDFPage, y: CGFloat, left: Bool)?
@@ -597,6 +597,14 @@ final class FolioPDFView: PDFView {
     override func mouseDown(with event: NSEvent) {
         onMouseDown?()
         let p = convert(event.locationInWindow, from: nil)
+        // ⌘-drag draws a margin note card.
+        if event.modifierFlags.contains(.command), !event.modifierFlags.contains(.option),
+           let page = page(for: p, nearest: true) {
+            noteStart = (page, convert(p, to: page))
+            noteMoved = false
+            clearSelection()
+            return
+        }
         // ⌥-drag in a margin draws a brace spanning the lines you drag past.
         if event.modifierFlags.contains(.option), let page = page(for: p, nearest: true) {
             let pp = convert(p, to: page)
@@ -620,6 +628,17 @@ final class FolioPDFView: PDFView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if let start = noteStart {
+            let q = convert(convert(event.locationInWindow, from: nil), to: start.page)
+            if !noteMoved, hypot(q.x - start.point.x, q.y - start.point.y) > 4 { noteMoved = true }
+            guard noteMoved else { return }
+            if let d = noteDraft { start.page.removeAnnotation(d) }
+            let d = MarginNoteAnnotation(box: Self.box(start.point, q, on: start.page), text: "", tint: .systemYellow, draft: true)
+            start.page.addAnnotation(d)
+            noteDraft = d
+            needsDisplay = true
+            return
+        }
         guard let start = braceStart else { super.mouseDragged(with: event); return }
         let pp = convert(convert(event.locationInWindow, from: nil), to: start.page)
         if let d = braceDraft { start.page.removeAnnotation(d); braceDraft = nil }
@@ -633,6 +652,16 @@ final class FolioPDFView: PDFView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let start = noteStart {
+            noteStart = nil
+            if let d = noteDraft { start.page.removeAnnotation(d); noteDraft = nil; needsDisplay = true }
+            guard noteMoved else { return }   // a plain ⌘-click does nothing
+            var r = Self.box(start.point, convert(convert(event.locationInWindow, from: nil), to: start.page), on: start.page)
+            if r.width < 40 { r.size.width = 110 }
+            if r.height < 18 { r.size.height = 44; r.origin.y -= 44 - 18 }
+            onMarginNote?(start.page, r)
+            return
+        }
         if let start = braceStart {
             braceStart = nil
             if let d = braceDraft { start.page.removeAnnotation(d); braceDraft = nil }
@@ -648,41 +677,7 @@ final class FolioPDFView: PDFView {
         reportSelection()
     }
 
-    // MARK: Right-drag: draw a margin note card. A plain right-click still shows the context menu.
-
-    override func rightMouseDown(with event: NSEvent) {
-        onMouseDown?()
-        let p = convert(event.locationInWindow, from: nil)
-        guard let page = page(for: p, nearest: true) else { super.rightMouseDown(with: event); return }
-        noteStart = (page, convert(p, to: page), event)
-        noteMoved = false
-    }
-
-    override func rightMouseDragged(with event: NSEvent) {
-        guard let start = noteStart else { super.rightMouseDragged(with: event); return }
-        let q = convert(convert(event.locationInWindow, from: nil), to: start.page)
-        if !noteMoved, hypot(q.x - start.point.x, q.y - start.point.y) > 6 { noteMoved = true; clearSelection() }
-        guard noteMoved else { return }
-        if let d = noteDraft { start.page.removeAnnotation(d) }
-        let d = MarginNoteAnnotation(box: Self.box(start.point, q, on: start.page), text: "", tint: .systemYellow, draft: true)
-        start.page.addAnnotation(d)
-        noteDraft = d
-        needsDisplay = true
-    }
-
-    override func rightMouseUp(with event: NSEvent) {
-        guard let start = noteStart else { super.rightMouseUp(with: event); return }
-        noteStart = nil
-        if let d = noteDraft { start.page.removeAnnotation(d); noteDraft = nil; needsDisplay = true }
-        if noteMoved {
-            var r = Self.box(start.point, convert(convert(event.locationInWindow, from: nil), to: start.page), on: start.page)
-            if r.width < 40 { r.size.width = 110 }
-            if r.height < 18 { r.size.height = 44; r.origin.y -= 44 - 18 }
-            onMarginNote?(start.page, r)
-        } else if let m = menu(for: start.event) {
-            NSMenu.popUpContextMenu(m, with: start.event, for: self)
-        }
-    }
+    // MARK: ⌘-drag: draw a margin note card.
 
     private static func box(_ a: NSPoint, _ b: NSPoint, on page: PDFPage) -> CGRect {
         let r = CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
