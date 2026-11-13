@@ -19,6 +19,7 @@ Native Swift / SwiftUI / PDFKit. No dependencies. Builds with the command-line t
 - Highlights in five colors plus underline, with notes; click a highlight to edit or remove it.
 - **Margin braces**: hold ⌥ Option and drag beside the text to draw a hand-drawn-style brace spanning those lines. Stored as a highlight of the lines it covers.
 - **Margin notes**: hold ⌘ Command and drag to draw a note card anywhere on the page and write in it. The note is linked to the lines beside it (or the nearest line), and shows up with that text in Notes & Highlights.
+- **Move and resize** braces and margin notes: click one to select it, drag it up or down to move it, or drag the dot at its top or bottom to stretch or shrink it. It re-links to the lines it ends up beside.
 - Sidebar: page thumbnails, table of contents, bookmarks, notes & highlights, in-book search.
 - Remembers your page per book; Go to Page accepts printed page labels (`xii`, `245`).
 

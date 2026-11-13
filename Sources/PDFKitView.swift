@@ -236,8 +236,8 @@ final class ReaderController {
 // MARK: - Margin brace annotation (drawn by hand, hit-tested by bounds)
 
 final class BraceAnnotation: PDFAnnotation {
-    private let lineRects: [CGRect]
-    private let onLeft: Bool
+    let lineRects: [CGRect]
+    let onLeft: Bool
     var ink = NSColor(calibratedWhite: 0.12, alpha: 0.9)
 
     init(rects: [CGRect], onLeft: Bool) {
@@ -280,11 +280,42 @@ final class BraceAnnotation: PDFAnnotation {
     }
 }
 
+// MARK: - Selection dots for braces and margin notes
+
+final class MarkHandlesView: NSView {
+    var dots: [NSPoint] = [] { didSet { needsDisplay = true } }
+    var outline: NSRect? { didSet { needsDisplay = true } }
+    static let radius: CGFloat = 4.5
+    override var isFlipped: Bool { superview?.isFlipped ?? false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let accent = NSColor.controlAccentColor
+        if let o = outline {
+            ctx.setStrokeColor(accent.withAlphaComponent(0.6).cgColor)
+            ctx.setLineWidth(1)
+            ctx.setLineDash(phase: 0, lengths: [3, 2])
+            ctx.stroke(o.insetBy(dx: -2, dy: -2))
+            ctx.setLineDash(phase: 0, lengths: [])
+        }
+        for d in dots {
+            let r = NSRect(x: d.x - Self.radius, y: d.y - Self.radius, width: Self.radius * 2, height: Self.radius * 2)
+            ctx.setShadow(offset: CGSize(width: 0, height: -0.5), blur: 2, color: NSColor(white: 0, alpha: 0.35).cgColor)
+            ctx.setFillColor(NSColor.white.cgColor)
+            ctx.fillEllipse(in: r)
+            ctx.setShadow(offset: .zero, blur: 0, color: nil)
+            ctx.setStrokeColor(accent.cgColor)
+            ctx.setLineWidth(1.5)
+            ctx.strokeEllipse(in: r.insetBy(dx: 0.75, dy: 0.75))
+        }
+    }
+}
+
 // MARK: - Margin note card (writing in the margin)
 
 final class MarginNoteAnnotation: PDFAnnotation {
-    private let text: String
-    private let tint: NSColor
+    let text: String
+    let tint: NSColor
     private let isDraft: Bool
 
     init(box: CGRect, text: String, tint: NSColor, draft: Bool = false) {
@@ -401,6 +432,159 @@ final class FolioPDFView: PDFView {
     var onMouseDown: (@MainActor () -> Void)?
     var onBrace: (@MainActor (PDFPage, [CGRect], String, Bool) -> Void)?
     var onMarginNote: (@MainActor (PDFPage, CGRect) -> Void)?
+    /// A brace or margin note was moved/resized: (id, page, isNote, new span or box in page space).
+    var onMarkEdited: (@MainActor (UUID, PDFPage, Bool, CGRect) -> Void)?
+
+    // MARK: Selecting, moving and resizing braces and margin notes
+
+    private enum MarkDragMode { case move, top, bottom }
+    private struct MarkDrag {
+        let id: UUID
+        let page: PDFPage
+        let original: PDFAnnotation
+        let isNote: Bool
+        let startY: CGFloat
+        let span: CGRect          // brace: union of its lines; note: its box (page space)
+        let mode: MarkDragMode
+        var moved = false
+        var draft: PDFAnnotation?
+        var current: CGRect
+    }
+    private var markDrag: MarkDrag?
+    private var selectedMark: (id: UUID, page: PDFPage)?
+    private var observingScroll = false
+
+    private lazy var handles: MarkHandlesView = {
+        let h = MarkHandlesView(frame: bounds)
+        h.autoresizingMask = [.width, .height]
+        h.isHidden = true
+        addSubview(h, positioned: .above, relativeTo: nil)
+        return h
+    }()
+
+    static func isMovable(_ a: PDFAnnotation) -> Bool { a is BraceAnnotation || a is MarginNoteAnnotation }
+
+    private func markID(_ a: PDFAnnotation) -> UUID? {
+        guard let n = a.userName, n.hasPrefix(Self.annotationPrefix) else { return nil }
+        return UUID(uuidString: String(n.dropFirst(Self.annotationPrefix.count)))
+    }
+
+    private func markAnnotation(_ id: UUID, on page: PDFPage) -> PDFAnnotation? {
+        page.annotations.first { $0.userName == Self.annotationPrefix + id.uuidString && $0.shouldDisplay }
+    }
+
+    private func span(of a: PDFAnnotation) -> CGRect {
+        if let b = a as? BraceAnnotation { return b.lineRects.reduce(CGRect.null) { $0.union($1) } }
+        return a.bounds
+    }
+
+    /// Top and bottom dot positions (view space) for an annotation.
+    private func dotPoints(for a: PDFAnnotation, on page: PDFPage) -> (top: NSPoint, bottom: NSPoint) {
+        let b = a.bounds
+        return (convert(NSPoint(x: b.midX, y: b.maxY), from: page), convert(NSPoint(x: b.midX, y: b.minY), from: page))
+    }
+
+    func selectMark(_ id: UUID, on page: PDFPage) {
+        selectedMark = (id, page)
+        refreshHandles()
+    }
+
+    func deselectMark() {
+        guard selectedMark != nil else { return }
+        selectedMark = nil
+        refreshHandles()
+    }
+
+    func refreshHandles() {
+        startObservingScrollIfNeeded()
+        let shown: (PDFAnnotation, PDFPage)? = {
+            if let d = markDrag, let dr = d.draft { return (dr, d.page) }
+            if let s = selectedMark, let a = markAnnotation(s.id, on: s.page) { return (a, s.page) }
+            return nil
+        }()
+        guard let (a, page) = shown, visiblePages.contains(page) else {
+            handles.isHidden = true
+            if markDrag == nil, let s = selectedMark, markAnnotation(s.id, on: s.page) == nil { selectedMark = nil }
+            return
+        }
+        let d = dotPoints(for: a, on: page)
+        handles.dots = [d.top, d.bottom]
+        handles.outline = a is MarginNoteAnnotation ? convert(a.bounds, from: page) : nil
+        handles.isHidden = false
+    }
+
+    private func startObservingScrollIfNeeded() {
+        guard !observingScroll, let sv = subviews.compactMap({ $0 as? NSScrollView }).first else { return }
+        observingScroll = true
+        sv.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: sv.contentView, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshHandles() }
+        }
+        NotificationCenter.default.addObserver(forName: .PDFViewScaleChanged, object: self, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshHandles() }
+        }
+    }
+
+    private func beginMarkDrag(_ a: PDFAnnotation, on page: PDFPage, at p: NSPoint, mode: MarkDragMode) -> Bool {
+        guard let id = markID(a) else { return false }
+        let sp = span(of: a)
+        markDrag = MarkDrag(id: id, page: page, original: a, isNote: a is MarginNoteAnnotation,
+                            startY: convert(p, to: page).y, span: sp, mode: mode, current: sp)
+        clearSelection()
+        return true
+    }
+
+    private func continueMarkDrag(_ event: NSEvent) {
+        guard var d = markDrag else { return }
+        let y = convert(convert(event.locationInWindow, from: nil), to: d.page).y
+        let dy = y - d.startY
+        if !d.moved, abs(dy) < 3 { return }
+        d.moved = true
+        let s = d.span, minH: CGFloat = d.isNote ? 18 : 10
+        let crop = d.page.bounds(for: .cropBox)
+        var r: CGRect
+        switch d.mode {
+        case .move:
+            let ny = min(max(s.minY + dy, crop.minY), crop.maxY - s.height)
+            r = CGRect(x: s.minX, y: ny, width: s.width, height: s.height)
+        case .top:
+            let top = min(max(s.maxY + dy, s.minY + minH), crop.maxY)
+            r = CGRect(x: s.minX, y: s.minY, width: s.width, height: top - s.minY)
+        case .bottom:
+            let bottom = max(min(s.minY + dy, s.maxY - minH), crop.minY)
+            r = CGRect(x: s.minX, y: bottom, width: s.width, height: s.maxY - bottom)
+        }
+        d.original.shouldDisplay = false
+        if let old = d.draft { d.page.removeAnnotation(old) }
+        let draft: PDFAnnotation
+        if let note = d.original as? MarginNoteAnnotation {
+            draft = MarginNoteAnnotation(box: r, text: note.text, tint: note.tint)
+        } else {
+            let lines = d.page.lines(betweenY: r.minY, and: r.maxY).rects
+            draft = BraceAnnotation(rects: lines.isEmpty ? [r] : lines, onLeft: (d.original as? BraceAnnotation)?.onLeft ?? true)
+        }
+        d.page.addAnnotation(draft)
+        d.draft = draft
+        d.current = r
+        markDrag = d
+        refreshHandles()
+        needsDisplay = true
+    }
+
+    private func endMarkDrag() {
+        guard let d = markDrag else { return }
+        markDrag = nil
+        if let dr = d.draft { d.page.removeAnnotation(dr) }
+        d.original.shouldDisplay = true
+        selectedMark = (d.id, d.page)
+        if d.moved {
+            onMarkEdited?(d.id, d.page, d.isNote, d.current)
+        } else {
+            onHighlightClick?(d.id, convert(d.original.bounds, from: d.page))
+        }
+        refreshHandles()
+        needsDisplay = true
+    }
     private var noteStart: (page: PDFPage, point: NSPoint)?
     private var noteDraft: MarginNoteAnnotation?
     private var noteMoved = false
@@ -586,7 +770,17 @@ final class FolioPDFView: PDFView {
 
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
-        onHover?(convert(event.locationInWindow, from: nil))
+        let p = convert(event.locationInWindow, from: nil)
+        onHover?(p)
+        if let s = selectedMark, let a = markAnnotation(s.id, on: s.page) {
+            let d = dotPoints(for: a, on: s.page)
+            if hypot(p.x - d.top.x, p.y - d.top.y) < 9 || hypot(p.x - d.bottom.x, p.y - d.bottom.y) < 9 {
+                NSCursor.resizeUpDown.set(); return
+            }
+        }
+        if let page = page(for: p, nearest: false), let a = page.annotation(at: convert(p, to: page)), Self.isMovable(a) {
+            NSCursor.openHand.set()
+        }
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -597,6 +791,21 @@ final class FolioPDFView: PDFView {
     override func mouseDown(with event: NSEvent) {
         onMouseDown?()
         let p = convert(event.locationInWindow, from: nil)
+        let plain = event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
+        // Dots on the selected brace / note: stretch or shrink from that end.
+        if plain, event.clickCount == 1, let s = selectedMark, let a = markAnnotation(s.id, on: s.page) {
+            let d = dotPoints(for: a, on: s.page)
+            if hypot(p.x - d.top.x, p.y - d.top.y) < 9, beginMarkDrag(a, on: s.page, at: p, mode: .top) { return }
+            if hypot(p.x - d.bottom.x, p.y - d.bottom.y) < 9, beginMarkDrag(a, on: s.page, at: p, mode: .bottom) { return }
+        }
+        // Press on a brace or note: select it, and drag to move it up or down.
+        if plain, event.clickCount == 1, let page = page(for: p, nearest: false),
+           let a = page.annotation(at: convert(p, to: page)), Self.isMovable(a),
+           beginMarkDrag(a, on: page, at: p, mode: .move) {
+            NSCursor.closedHand.set()
+            return
+        }
+        deselectMark()
         // ⌘-drag draws a margin note card.
         if event.modifierFlags.contains(.command), !event.modifierFlags.contains(.option),
            let page = page(for: p, nearest: true) {
@@ -628,6 +837,7 @@ final class FolioPDFView: PDFView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if markDrag != nil { continueMarkDrag(event); return }
         if let start = noteStart {
             let q = convert(convert(event.locationInWindow, from: nil), to: start.page)
             if !noteMoved, hypot(q.x - start.point.x, q.y - start.point.y) > 4 { noteMoved = true }
@@ -652,6 +862,7 @@ final class FolioPDFView: PDFView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if markDrag != nil { endMarkDrag(); return }
         if let start = noteStart {
             noteStart = nil
             if let d = noteDraft { start.page.removeAnnotation(d); noteDraft = nil; needsDisplay = true }
@@ -864,6 +1075,22 @@ struct PDFKitView: NSViewRepresentable {
                 LibraryStore.shared.addHighlights(self.parent.bookID, [h])
             }
             v.onHighlightClick = { [weak self] id, r in self?.showMenu(forExisting: id, at: r) }
+            v.onMarkEdited = { [weak self] id, page, isNote, r in
+                guard let self else { return }
+                let bookID = self.parent.bookID
+                if isNote {
+                    let linked = page.linesBeside(r)
+                    LibraryStore.shared.updateHighlight(bookID, id) {
+                        $0.box = r
+                        $0.rects = linked.rects.isEmpty ? [r] : linked.rects
+                        $0.text = linked.text
+                    }
+                } else {
+                    let found = page.lines(betweenY: r.minY, and: r.maxY)
+                    guard !found.rects.isEmpty else { return }   // dragged off the text: keep where it was
+                    LibraryStore.shared.updateHighlight(bookID, id) { $0.rects = found.rects; $0.text = found.text }
+                }
+            }
             v.onMarginNote = { [weak self] page, box in
                 guard let self, let v = self.view, let doc = v.document else { return }
                 let linked = page.linesBeside(box)
@@ -873,6 +1100,7 @@ struct PDFKitView: NSViewRepresentable {
                 LibraryStore.shared.addHighlights(self.parent.bookID, [h])
                 self.parent.controller.pendingNewNote = h.id
                 self.showMenu(forExisting: h.id, at: v.convert(box, from: page), edit: true)
+                DispatchQueue.main.async { v.selectMark(h.id, on: page) }
             }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
                 MainActor.assumeIsolated { self?.handleKey(e) == true ? nil : e }
@@ -1016,6 +1244,7 @@ struct PDFKitView: NSViewRepresentable {
             parent.controller.currentPage = idx
             parent.controller.menu = nil
             lastActivity = Date()
+            v.deselectMark()
             parent.onPageChange(idx)
             v.coverForNight()
             NightRendering.prefetch(doc, around: idx)
@@ -1042,12 +1271,13 @@ struct PDFKitView: NSViewRepresentable {
 
         func syncHighlights(_ hs: [Highlight], force: Bool) {
             var hasher = Hasher()
-            for h in hs { hasher.combine(h.id); hasher.combine(h.color); hasher.combine(h.note) }
+            for h in hs { hasher.combine(h) }   // geometry too, so moves and resizes redraw
             let sig = hasher.finalize()
             guard force || sig != highlightSig else { return }
             highlightSig = sig
             FolioPDFView.sync(hs, into: parent.document)
             view?.needsDisplay = true
+            view?.refreshHandles()
         }
 
         /// Flip a PDFView (bottom-left origin) rect into SwiftUI's top-left origin space.
@@ -1083,6 +1313,7 @@ struct PDFKitView: NSViewRepresentable {
             if e.keyCode == 53, parent.controller.menu != nil {                 // esc closes the bubble
                 parent.controller.dismissMenu(); return true
             }
+            if e.keyCode == 53 { v.deselectMark() }
             let mods = e.modifierFlags.intersection([.command, .option, .control])
             if mods == .command, let ch = e.charactersIgnoringModifiers {
                 switch ch {
